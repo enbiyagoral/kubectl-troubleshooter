@@ -1,0 +1,148 @@
+#!/bin/bash
+
+# Kubectl Troubleshooter (kubectl ts): Kubernetes issue analysis tool
+
+TARGET_TYPE=$1
+TARGET_NAME=$2
+NAMESPACE="default"  # Default namespace
+VERBOSE=false        # By default, detailed information is not displayed
+
+# Color codes
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+RED='\033[0;31m'
+CYAN='\033[0;36m'
+NC='\033[0m' # No Color
+
+# Usage guide
+usage() {
+    echo -e "${CYAN}Kubectl Troubleshooter - Kubernetes Pod and Status Analysis Tool${NC}"
+    echo "Usage:"
+    echo "  kubectl ts pod <pod-name> [--namespace <namespace>] [--verbose]"
+    echo "  kubectl ts pods --all-namespaces"
+    echo "Options:"
+    echo "  --namespace <namespace>  The namespace where the pod is located (default: 'default')."
+    echo "  --verbose                More detailed information (container status, events)."
+    echo "  --help                   Show help message."
+    echo "Examples:"
+    echo "  kubectl ts pod my-app-pod --namespace production"
+    echo "  kubectl ts pod my-app-pod --verbose"
+    echo "  kubectl ts pods --all-namespaces"
+    exit 1
+}
+
+# Check for the help command
+if [[ "$1" == "--help" || -z "$1" ]]; then
+    usage
+fi
+
+# Check for namespace and --verbose parameters
+for i in "$@"; do
+    case $i in
+        --namespace=*)
+            NAMESPACE="${i#*=}"
+            shift
+            ;;
+        --verbose|--details)
+            VERBOSE=true
+            shift
+            ;;
+    esac
+done
+
+# Analyze all pods across all namespaces
+if [[ "$TARGET_TYPE" == "pods" && "$TARGET_NAME" == "--all-namespaces" ]]; then
+    echo -e "${CYAN}Analyzing all pods in all namespaces...${NC}"
+
+    # Fetch pods in JSON format
+    kubectl get pods --all-namespaces -o json | jq -c '.items[]' | while read -r pod; do
+
+        POD_NAME=$(echo "$pod" | jq -r '.metadata.name')
+        POD_NAMESPACE=$(echo "$pod" | jq -r '.metadata.namespace')
+        POD_PHASE=$(echo "$pod" | jq -r '.status.phase')
+        POD_CONTAINERS=$(echo "$pod" | jq -c '.status.containerStatuses[]?')
+
+        if [[ "$POD_PHASE" == "Running" ]]; then
+            echo -e "${GREEN}✅ Namespace: $POD_NAMESPACE, Pod: $POD_NAME is running successfully.${NC}"
+        else
+
+            echo -e "${RED}❌ Namespace: $POD_NAMESPACE, Pod: $POD_NAME is in state: $POD_PHASE${NC}"
+            
+            if [ "$VERBOSE" == true ]; then
+                echo "$POD_CONTAINERS" | jq -r '{
+                    name: .name,
+                    state: .state | keys[0],
+                    reason: .state[]?.reason // "N/A",
+                    message: .state[]?.message // "N/A"
+                } | "  Container: \(.name)\n    State: \(.state)\n    Reason: \(.reason)\n    Message: \(.message)"'
+            fi
+        fi
+    done
+    exit 0
+fi
+
+# Pod Analysis
+if [ "$TARGET_TYPE" == "pod" ]; then
+    echo -e "${CYAN}Analyzing pod '$TARGET_NAME' in namespace '$NAMESPACE'...${NC}"
+
+    POD_JSON=$(kubectl get pod "$TARGET_NAME" -n "$NAMESPACE" -o json 2>/dev/null)
+
+    if [ -z "$POD_JSON" ]; then
+        echo -e "${RED}❌ Error: Pod '$TARGET_NAME' not found in namespace '$NAMESPACE'.${NC}"
+        exit 1
+    fi
+
+    POD_STATUS=$(echo "$POD_JSON" | jq -r '.status.phase')
+    echo -e "${CYAN}Pod Status:${NC} $POD_STATUS"
+
+    case $POD_STATUS in
+        Running)
+            echo -e "${GREEN}✅ Pod '$TARGET_NAME' is running successfully!${NC}"
+            ;;
+        Pending)
+            echo -e "${YELLOW}⚠️  Pod '$TARGET_NAME' is in Pending state.${NC}"
+            echo "Suggested actions:"
+            echo "- Check for insufficient node resources (e.g., CPU or Memory)."
+            echo "- Run 'kubectl describe pod $TARGET_NAME -n $NAMESPACE' for more details."
+            if [ "$VERBOSE" == false ]; then
+                echo "- Run 'kubectl ts pod $TARGET_NAME --namespace $NAMESPACE --verbose' for detailed analysis."
+            fi
+            ;;
+        Failed)
+            echo -e "${RED}❌ Pod '$TARGET_NAME' has failed.${NC}"
+            echo "Suggested actions:"
+            echo "- Run 'kubectl logs $TARGET_NAME -n $NAMESPACE' to check the logs."
+            echo "- Check Events using 'kubectl describe pod $TARGET_NAME -n $NAMESPACE'."
+            if [ "$VERBOSE" == false ]; then
+                echo "- Run 'kubectl ts pod $TARGET_NAME --namespace $NAMESPACE --verbose' for detailed analysis."
+            fi
+            ;;
+        CrashLoopBackOff)
+            echo -e "${RED}❌ Pod '$TARGET_NAME' is in CrashLoopBackOff state.${NC}"
+            echo "Suggested actions:"
+            echo "- Inspect the logs using 'kubectl logs $TARGET_NAME -n $NAMESPACE'."
+            echo "- Verify the liveness and readiness probes in your deployment."
+            ;;
+        OOMKilled)
+            echo -e "${RED}❌ Pod '$TARGET_NAME' was terminated due to insufficient memory (OOMKilled).${NC}"
+            echo "Suggested actions:"
+            echo "- Increase the memory limits in your pod specification."
+            echo "- Check the node's memory usage using 'kubectl describe node <node-name>'."
+            ;;
+        Evicted)
+            echo -e "${RED}❌ Pod '$TARGET_NAME' has been evicted from the node.${NC}"
+            echo "Suggested actions:"
+            echo "- Free up space on the node or increase node resources."
+            echo "- Run 'kubectl describe node <node-name>' to check for DiskPressure or MemoryPressure."
+            ;;
+        *)
+            echo -e "${YELLOW}ℹ️ Pod '$TARGET_NAME' is in an unhandled state: $POD_STATUS${NC}"
+            ;;
+    esac
+
+    exit 0
+fi
+
+# Unknown target type
+echo -e "${RED}❌ Error: Unknown target type '$TARGET_TYPE'. Supported types are 'pod' or 'pods --all-namespaces'.${NC}"
+usage
